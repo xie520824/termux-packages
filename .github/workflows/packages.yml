@@ -247,6 +247,9 @@ jobs:
     - name: Load Docker image
       if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
       run: |
+        git clone https://github.com/termux/termux-packages
+        cd termux-packages
+        sed -i 's/com\.termux/com.bai.csharpide/g' scripts/properties.sh
         ./scripts/run-docker.sh true
 
     - name: Free additional disk space (if needed)
