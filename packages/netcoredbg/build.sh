@@ -15,6 +15,7 @@ TERMUX_PKG_AUTO_UPDATE=false
 
 termux_step_pre_configure() {
     # Setup .NET environment
+    termux_setup_cmake
     termux_setup_dotnet
 
     export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
@@ -48,6 +49,7 @@ termux_step_pre_configure() {
     LOGI "构建配置:"
     LOGI "  架构: ${TERMUX_ARCH} -> ${_ARCH}"
     LOGI "  ABI: ${_ABI}"
+    LOGI "  NDK 路径: ${TERMUX_STANDALONE_TOOLCHAIN}"
     LOGI ".NET 版本: ${TERMUX_DOTNET_VERSION}"
 }
 
@@ -114,12 +116,19 @@ PYTHON_PATCH
 
     LOGI "CMake 配置开始..."
     
-    # Configure with CMake - explicitly link libunwind and libc++
+    # Ensure CMAKE_MAKE_PROGRAM is set
+    if ! command -v ninja &>/dev/null; then
+        LOGI "ninja 未找到，使用 make"
+        export CMAKE_MAKE_PROGRAM=$(which make)
+    else
+        export CMAKE_MAKE_PROGRAM=$(which ninja)
+    fi
+
+    # Configure with CMake using Termux toolchain
+    # Use the standard Termux CMake configuration
     cmake "${TERMUX_PKG_SRCDIR}" \
+        -DCMAKE_TOOLCHAIN_FILE="${TERMUX_CMAKE_TOOLCHAIN}" \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_SYSTEM_NAME=Android \
-        -DCMAKE_SYSTEM_VERSION="${TERMUX_PKG_API_LEVEL}" \
-        -DCMAKE_ANDROID_ARCH_ABI="${ANDROID_ABI}" \
         -DCMAKE_PREFIX_PATH="${TERMUX_PREFIX}" \
         -DCMAKE_INSTALL_PREFIX="${TERMUX_PREFIX}" \
         -DCMAKE_CXX_STANDARD=17 \
@@ -131,10 +140,33 @@ PYTHON_PATCH
         -DCMAKE_FIND_ROOT_PATH="${TERMUX_PREFIX}" \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+        -DCMAKE_MAKE_PROGRAM="${CMAKE_MAKE_PROGRAM}"
     
     if [[ $? -ne 0 ]]; then
-        termux_error_exit "CMake 配置失败"
+        LOGE "CMake 配置失败"
+        # Try alternative configuration without toolchain file
+        LOGI "尝试使用替代配置..."
+        
+        cmake "${TERMUX_PKG_SRCDIR}" \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DCMAKE_CXX_COMPILER="${CXX}" \
+            -DCMAKE_AR="${AR}" \
+            -DCMAKE_RANLIB="${RANLIB}" \
+            -DCMAKE_STRIP="${STRIP}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${TERMUX_PREFIX}" \
+            -DCMAKE_INSTALL_PREFIX="${TERMUX_PREFIX}" \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_CXX_FLAGS="${CXXFLAGS} -std=c++17 -stdlib=libc++ -fPIC" \
+            -DCMAKE_C_FLAGS="${CFLAGS} -fPIC" \
+            -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++" \
+            -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++" \
+            -DCMAKE_MAKE_PROGRAM="${CMAKE_MAKE_PROGRAM}"
+        
+        if [[ $? -ne 0 ]]; then
+            termux_error_exit "CMake 配置失败（所有方法均失败）"
+        fi
     fi
     
     LOGI "CMake 配置完成"
@@ -145,9 +177,11 @@ termux_step_make() {
     cd "${TERMUX_PKG_BUILDDIR}/cmake_build"
     
     # Build with make or ninja
-    if command -v ninja &>/dev/null; then
+    if command -v ninja &>/dev/null && [[ -f build.ninja ]]; then
+        LOGI "使用 ninja 编译..."
         ninja -j "${TERMUX_PKG_MAKE_PROCESSES}" netcoredbg
     else
+        LOGI "使用 make 编译..."
         make -j "${TERMUX_PKG_MAKE_PROCESSES}"
     fi
     
@@ -183,8 +217,10 @@ termux_step_make_install() {
         netcoredbg_binary=$(find . -maxdepth 3 -name netcoredbg -type f 2>/dev/null | head -n1)
         if [[ -z "$netcoredbg_binary" ]]; then
             # List what we have
-            ls -la . || true
+            LOGE "二进制文件搜索结果:"
+            ls -la . 2>/dev/null || true
             ls -la Release/ 2>/dev/null || true
+            ls -la bin/ 2>/dev/null || true
             termux_error_exit "编译后找不到 netcoredbg 二进制文件"
         fi
     fi
@@ -202,14 +238,13 @@ termux_step_make_install() {
     
     # Find libdbgshim.so variants
     local libdbgshim_found=false
-    for pattern in "libdbgshim.so*" "Release/libdbgshim.so*"; do
-        for f in $(find . -maxdepth 2 -name "libdbgshim.so*" -type f 2>/dev/null); do
-            if [[ -f "$f" ]]; then
-                cp "$f" "${TERMUX_PREFIX}/lib/$(basename $f)"
-                LOGI "已安装 $(basename $f)"
-                libdbgshim_found=true
-            fi
-        done
+    for f in $(find . -maxdepth 2 -name "libdbgshim.so*" -type f 2>/dev/null); do
+        if [[ -f "$f" ]]; then
+            cp "$f" "${TERMUX_PREFIX}/lib/$(basename $f)"
+            chmod 755 "${TERMUX_PREFIX}/lib/$(basename $f)"
+            LOGI "已安装 $(basename $f)"
+            libdbgshim_found=true
+        fi
     done
 
     # Verify installation
@@ -244,14 +279,19 @@ termux_step_post_make_install() {
     # Show library dependencies using readelf if available
     if command -v readelf &>/dev/null; then
         LOGI "netcoredbg 库依赖关系:"
-        readelf -d "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null | grep NEEDED | head -5
+        readelf -d "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null | grep NEEDED | head -10
     fi
 
     # List installed files
     LOGI "已安装的文件:"
-    ls -lh "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null && LOGI "  ✓ netcoredbg"
-    if ls "${TERMUX_PREFIX}/lib/libdbgshim.so"* 2>/dev/null | head -1; then
+    if [[ -f "${TERMUX_PREFIX}/bin/netcoredbg" ]]; then
+        ls -lh "${TERMUX_PREFIX}/bin/netcoredbg"
+        LOGI "  ✓ netcoredbg"
+    fi
+    
+    if ls "${TERMUX_PREFIX}/lib/libdbgshim.so"* 2>/dev/null | head -1 >/dev/null; then
         LOGI "  ✓ libdbgshim libraries"
+        ls -lh "${TERMUX_PREFIX}/lib/libdbgshim.so"*
     fi
 
     LOGI "安装验证完成"
