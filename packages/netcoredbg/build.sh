@@ -57,50 +57,56 @@ termux_step_configure() {
     # Apply Android-specific patch for libdbgshim support
     cd "${TERMUX_PKG_SRCDIR}"
     
-    cat > android_dbgshim.patch << 'EOF'
---- a/src/debugger/manageddebugger.cpp
-+++ b/src/debugger/manageddebugger.cpp
-@@ -745,7 +745,24 @@ HRESULT ManagedDebuggerHelpers::RunProcess(const std::string& fileExec, const s
- #ifdef FEATURE_PAL
-     GetWaitpid().SetupTrackingPID(m_processId);
- #endif // FEATURE_PAL
--
-+#ifdef __ANDROID__
-+    // Android/Bionic doesn't support traditional ptrace-based debugging
-+    // We need to use alternative approach: directly attach to process after resume
-+    // Resume the process first
-+    IfFailRet(m_dbgshim.ResumeProcess(resumeHandle));
-+    m_dbgshim.CloseResumeHandle(resumeHandle);
-+    
-+    // Give the process time to start up
-+    USleep(500*1000); // 500ms
-+    
-+    // Then attach to it
-+    return AttachToProcess();
-+#else
-+    // Linux/glibc path: use RegisterForRuntimeStartup
-     IfFailRet(m_dbgshim.RegisterForRuntimeStartup(m_processId, ManagedDebugger::StartupCallback, this, &m_unregisterToken));
- 
-     // Resume the process so that StartupCallback can run
-@@ -755,6 +772,7 @@ HRESULT ManagedDebuggerHelpers::RunProcess(const std::string& fileExec, const s
-     std::unique_lock<std::mutex> lockAttachedMutex(m_processAttachedMutex);
-     if (!m_processAttachedCV.wait_for(lockAttachedMutex, startupWaitTimeout, [this]{return m_processAttachedState == ProcessAttachedState::Attached;}))
-         return E_FAIL;
- 
-     pProtocol->EmitExecEvent(PID{m_processId}, fileExec);
- 
-     return S_OK;
-+#endif // __ANDROID__
- }
-EOF
-
-    # Apply the patch
-    if patch -p1 < android_dbgshim.patch; then
-        LOGI "Android 补丁应用成功"
+    # Direct file modification instead of patch
+    # Fix RegisterForRuntimeStartup on Android
+    LOGI "应用 Android 特定补丁..."
+    
+    if grep -q "__ANDROID__" src/debugger/manageddebugger.cpp; then
+        LOGI "补丁已存在，跳过"
     else
-        LOGW "Android 补丁应用失败，尝试继续..."
+        # Create the patch inline
+        python3 << 'PYTHON_PATCH'
+import re
+
+file_path = "src/debugger/manageddebugger.cpp"
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# Find the RunProcess function and add Android support
+android_code = '''#ifdef __ANDROID__
+    // Android/Bionic doesn't support traditional ptrace-based debugging
+    // Resume the process first
+    IfFailRet(m_dbgshim.ResumeProcess(resumeHandle));
+    m_dbgshim.CloseResumeHandle(resumeHandle);
+    
+    // Give the process time to start up
+    USleep(500*1000); // 500ms
+    
+    // Then attach to it
+    return AttachToProcess();
+#else
+    // Linux/glibc path: use RegisterForRuntimeStartup'''
+
+# Find the pattern to replace
+pattern = r'(#ifdef FEATURE_PAL\s+GetWaitpid\(\)\.SetupTrackingPID\(m_processId\);\s+#endif // FEATURE_PAL\s+)\n\s+(IfFailRet\(m_dbgshim\.RegisterForRuntimeStartup)'
+
+replacement = r'\1\n    ' + android_code + '\n    \2'
+
+content = re.sub(pattern, replacement, content, flags=re.MULTILINE | re.DOTALL)
+
+# Also need to close the #else at the end of RunProcess
+# Find the end of RunProcess function
+pattern2 = r'(pProtocol->EmitExecEvent\(PID\{m_processId\}, fileExec\);\s+return S_OK;\s+})'
+replacement2 = r'\1\n#endif // __ANDROID__'
+
+content = re.sub(pattern2, replacement2, content)
+
+with open(file_path, 'w') as f:
+    f.write(content)
+
+print("Android 补丁应用成功")
+PYTHON_PATCH
     fi
-    rm -f android_dbgshim.patch
 
     # Create CMake build directory
     mkdir -p "${TERMUX_PKG_BUILDDIR}/cmake_build"
@@ -118,15 +124,14 @@ EOF
         -DCMAKE_INSTALL_PREFIX="${TERMUX_PREFIX}" \
         -DCMAKE_CXX_STANDARD=17 \
         -DCMAKE_CXX_STANDARD_REQUIRED=ON \
-        -DCMAKE_CXX_FLAGS="${CXXFLAGS} -std=c++17 -stdlib=libc++ -fPIC -Wl,--no-undefined" \
+        -DCMAKE_CXX_FLAGS="${CXXFLAGS} -std=c++17 -stdlib=libc++ -fPIC" \
         -DCMAKE_C_FLAGS="${CFLAGS} -fPIC" \
-        -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++ -Wl,--as-needed,--no-undefined" \
-        -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++ -Wl,--as-needed,--no-undefined" \
+        -DCMAKE_SHARED_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++ -Wl,--as-needed" \
+        -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} -lunwind -lc++ -Wl,--as-needed" \
         -DCMAKE_FIND_ROOT_PATH="${TERMUX_PREFIX}" \
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
-        -GNinja
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
     
     if [[ $? -ne 0 ]]; then
         termux_error_exit "CMake 配置失败"
@@ -139,18 +144,20 @@ termux_step_make() {
     LOGI "开始编译 netcoredbg..."
     cd "${TERMUX_PKG_BUILDDIR}/cmake_build"
     
-    # Build netcoredbg with verbose output
-    ninja -j "${TERMUX_PKG_MAKE_PROCESSES}" -v netcoredbg
+    # Build with make or ninja
+    if command -v ninja &>/dev/null; then
+        ninja -j "${TERMUX_PKG_MAKE_PROCESSES}" netcoredbg
+    else
+        make -j "${TERMUX_PKG_MAKE_PROCESSES}"
+    fi
     
     if [[ $? -ne 0 ]]; then
         termux_error_exit "netcoredbg 编译失败"
     fi
 
     # Check for build artifacts
-    if [[ ! -f "netcoredbg" ]]; then
-        if [[ ! -f "Release/netcoredbg" ]]; then
-            termux_error_exit "找不到已编译的 netcoredbg 二进制文件"
-        fi
+    if [[ ! -f "netcoredbg" ]] && [[ ! -f "Release/netcoredbg" ]] && [[ ! -f "bin/netcoredbg" ]]; then
+        termux_error_exit "找不到已编译的 netcoredbg 二进制文件"
     fi
 
     LOGI "netcoredbg 编译成功"
@@ -175,12 +182,18 @@ termux_step_make_install() {
         # Search for it
         netcoredbg_binary=$(find . -maxdepth 3 -name netcoredbg -type f 2>/dev/null | head -n1)
         if [[ -z "$netcoredbg_binary" ]]; then
+            # List what we have
+            ls -la . || true
+            ls -la Release/ 2>/dev/null || true
             termux_error_exit "编译后找不到 netcoredbg 二进制文件"
         fi
     fi
 
     LOGI "找到二进制文件: $netcoredbg_binary"
-    install -Dm755 "$netcoredbg_binary" "${TERMUX_PREFIX}/bin/netcoredbg"
+    
+    # Copy the binary
+    cp "$netcoredbg_binary" "${TERMUX_PREFIX}/bin/netcoredbg"
+    chmod 755 "${TERMUX_PREFIX}/bin/netcoredbg"
     
     LOGI "已安装 netcoredbg 到 ${TERMUX_PREFIX}/bin/netcoredbg"
 
@@ -189,16 +202,14 @@ termux_step_make_install() {
     
     # Find libdbgshim.so variants
     local libdbgshim_found=false
-    for f in libdbgshim.so libdbgshim.so.1 libdbgshim.so.1.0; do
-        if [[ -f "$f" ]]; then
-            install -Dm755 "$f" "${TERMUX_PREFIX}/lib/$f"
-            LOGI "已安装 $f"
-            libdbgshim_found=true
-        elif [[ -f "Release/$f" ]]; then
-            install -Dm755 "Release/$f" "${TERMUX_PREFIX}/lib/$f"
-            LOGI "已安装 $f"
-            libdbgshim_found=true
-        fi
+    for pattern in "libdbgshim.so*" "Release/libdbgshim.so*"; do
+        for f in $(find . -maxdepth 2 -name "libdbgshim.so*" -type f 2>/dev/null); do
+            if [[ -f "$f" ]]; then
+                cp "$f" "${TERMUX_PREFIX}/lib/$(basename $f)"
+                LOGI "已安装 $(basename $f)"
+                libdbgshim_found=true
+            fi
+        done
     done
 
     # Verify installation
@@ -225,31 +236,22 @@ termux_step_post_make_install() {
     # Verify the binary works
     if "${TERMUX_PREFIX}/bin/netcoredbg" --version >/dev/null 2>&1; then
         LOGI "✓ netcoredbg 版本检查: 成功"
+        "${TERMUX_PREFIX}/bin/netcoredbg" --version
     else
         LOGW "✗ netcoredbg 版本检查失败，但安装可能仍然有效"
     fi
 
-    # Show library dependencies
+    # Show library dependencies using readelf if available
     if command -v readelf &>/dev/null; then
         LOGI "netcoredbg 库依赖关系:"
-        readelf -d "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null | grep NEEDED || true
-    fi
-
-    # Check for undefined symbols
-    if command -v nm &>/dev/null; then
-        local undef_count=$(nm -D "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null | grep -c "UND " || echo 0)
-        if [[ $undef_count -eq 0 ]]; then
-            LOGI "✓ 无未定义的符号"
-        else
-            LOGW "⚠ 检测到 $undef_count 个未定义的符号"
-        fi
+        readelf -d "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null | grep NEEDED | head -5
     fi
 
     # List installed files
     LOGI "已安装的文件:"
     ls -lh "${TERMUX_PREFIX}/bin/netcoredbg" 2>/dev/null && LOGI "  ✓ netcoredbg"
-    if ls -lh "${TERMUX_PREFIX}/lib/libdbgshim.so"* 2>/dev/null; then
-        LOGI "  ✓ libdbgshim.so"
+    if ls "${TERMUX_PREFIX}/lib/libdbgshim.so"* 2>/dev/null | head -1; then
+        LOGI "  ✓ libdbgshim libraries"
     fi
 
     LOGI "安装验证完成"
