@@ -58,6 +58,66 @@ termux_step_configure() {
     
     cd "${TERMUX_PKG_SRCDIR}"
     
+    # Apply Android-specific patch for libdbgshim support
+    # On Android, /proc/[pid]/maps may be inaccessible or show anonymous mappings
+    # ([anon:linker_alloc]), causing RegisterForRuntimeStartup to fail.
+    # Instead, we use ResumeProcess + AttachToProcess.
+    LOGI "应用 Android 特定补丁..."
+    
+    if grep -q "__ANDROID__" src/debugger/manageddebugger.cpp; then
+        LOGI "补丁已存在，跳过"
+    else
+        python3 << 'PYTHON_PATCH'
+import re
+
+file_path = "src/debugger/manageddebugger.cpp"
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# Pattern to find the RegisterForRuntimeStartup block
+pattern = r'''(    IfFailRet\(m_dbgshim\.RegisterForRuntimeStartup\(m_processId, ManagedDebugger::StartupCallback, this, &m_unregisterToken\)\);)
+
+    // Resume the process so that StartupCallback can run
+    (IfFailRet\(m_dbgshim\.ResumeProcess\(resumeHandle\)\);
+    m_dbgshim\.CloseResumeHandle\(resumeHandle\);)
+
+    (std::unique_lock<std::mutex> lockAttachedMutex\(m_processAttachedMutex\);
+    if \(!m_processAttachedCV\.wait_for\(lockAttachedMutex, startupWaitTimeout, \[this\]\{return m_processAttachedState == ProcessAttachedState::Attached;\}\)\)
+        return E_FAIL;
+
+    pProtocol->EmitExecEvent\(PID\{m_processId\}, fileExec\);
+
+    return S_OK;)
+}'''
+
+replacement = r'''#ifdef __ANDROID__
+    // Android: /proc/[pid]/maps may be inaccessible or show anonymous mappings
+    // ([anon:linker_alloc]), causing RegisterForRuntimeStartup to fail.
+    // Use ResumeProcess + AttachToProcess instead.
+    \2
+    
+    USleep(500*1000); // 500ms wait for runtime to initialize
+    
+    return AttachToProcess();
+#else
+    \1
+
+    // Resume the process so that StartupCallback can run
+    \2
+
+    \3
+#endif // __ANDROID__
+}'''
+
+content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+with open(file_path, 'w') as f:
+    f.write(content)
+
+print("Android 补丁应用成功")
+PYTHON_PATCH
+    fi
+    
     # Create CMake build directory
     mkdir -p "${TERMUX_PKG_BUILDDIR}/cmake_build"
     cd "${TERMUX_PKG_BUILDDIR}/cmake_build"
