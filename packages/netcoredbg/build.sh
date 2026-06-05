@@ -56,72 +56,19 @@ termux_step_pre_configure() {
 termux_step_configure() {
     LOGI "配置 netcoredbg..."
     
-    # Apply Android-specific patch for libdbgshim support
     cd "${TERMUX_PKG_SRCDIR}"
     
-    # Direct file modification instead of patch
-    # Fix RegisterForRuntimeStartup on Android
-    LOGI "应用 Android 特定补丁..."
-    
-    if grep -q "__ANDROID__" src/debugger/manageddebugger.cpp; then
-        LOGI "补丁已存在，跳过"
-    else
-        # Create the patch inline
-        python3 << 'PYTHON_PATCH'
-import re
-
-file_path = "src/debugger/manageddebugger.cpp"
-with open(file_path, 'r') as f:
-    content = f.read()
-
-# Find the RunProcess function and add Android support
-android_code = '''#ifdef __ANDROID__
-    // Android/Bionic doesn't support traditional ptrace-based debugging
-    // Resume the process first
-    IfFailRet(m_dbgshim.ResumeProcess(resumeHandle));
-    m_dbgshim.CloseResumeHandle(resumeHandle);
-    
-    // Give the process time to start up
-    USleep(500*1000); // 500ms
-    
-    // Then attach to it
-    return AttachToProcess();
-#else
-    // Linux/glibc path: use RegisterForRuntimeStartup'''
-
-# Find the pattern to replace
-pattern = r'(#ifdef FEATURE_PAL\s+GetWaitpid\(\)\.SetupTrackingPID\(m_processId\);\s+#endif // FEATURE_PAL\s+)\n\s+(IfFailRet\(m_dbgshim\.RegisterForRuntimeStartup)'
-
-replacement = r'\1\n    ' + android_code + '\n    \2'
-
-content = re.sub(pattern, replacement, content, flags=re.MULTILINE | re.DOTALL)
-
-# Also need to close the #else at the end of RunProcess
-# Find the end of RunProcess function
-pattern2 = r'(pProtocol->EmitExecEvent\(PID\{m_processId\}, fileExec\);\s+return S_OK;\s+})'
-replacement2 = r'\1\n#endif // __ANDROID__'
-
-content = re.sub(pattern2, replacement2, content)
-
-with open(file_path, 'w') as f:
-    f.write(content)
-
-print("Android 补丁应用成功")
-PYTHON_PATCH
-    fi
-
     # Create CMake build directory
     mkdir -p "${TERMUX_PKG_BUILDDIR}/cmake_build"
     cd "${TERMUX_PKG_BUILDDIR}/cmake_build"
-
+    
     LOGI "CMake 配置开始..."
     
     # Ensure CMAKE_MAKE_PROGRAM is set
-    if ! command -v ninja &>/dev/null; then
-        LOGI "ninja 未找到，使用 make"
-        export CMAKE_MAKE_PROGRAM=$(which make)
-    else
+    if command -v ninja &>/dev/null; then
         export CMAKE_MAKE_PROGRAM=$(which ninja)
+    else
+        export CMAKE_MAKE_PROGRAM=$(which make)
     fi
 
     # Configure with CMake using Termux toolchain
